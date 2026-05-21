@@ -842,107 +842,584 @@ public static class ClipboardFusionHelper
 		return string.Join("\n", wrappedLines);
 	}
 
-	public static string ProcessText(string inputText)
+	private static string BuildCombinedResult(IList<string> historyItems, IList<int> selectedHistoryIndices, bool isNumberedMode, string itemAffixText, string separatorText)
 	{
-		ClipboardManagerSource currentSource = GetInitialClipboardManagerSource(inputText);
-		List<string> historyItems = GetClipboardManagerItems(currentSource);
-		List<int> allHistoryIndices = GetAllHistoryIndices(historyItems.Count);
-
-		Rectangle screenWorkingArea = Screen.PrimaryScreen.WorkingArea;
-		int formWidth = Math.Max(MinimumFormWidth, screenWorkingArea.Width * InitialFormSizeRatioNumerator / InitialFormSizeRatioDenominator);
-		int formHeight = Math.Max(MinimumFormHeight, screenWorkingArea.Height * InitialFormSizeRatioNumerator / InitialFormSizeRatioDenominator);
-		var monospaceFont = new Font("Consolas", 9f);
-
-		var combineHistoryForm = new Form {
-			Text = "Combine History", Font = monospaceFont,
-			Width = formWidth, Height = formHeight, MinimumSize = new Size(MinimumFormWidth, MinimumFormHeight),
-			StartPosition = FormStartPosition.CenterScreen
-		};
-		combineHistoryForm.Disposed += (sender, eventArgs) => {
-			monospaceFont.Dispose();
-		};
-
-		var historyListBox = new CoalescingListBox {
-			SelectionMode = SelectionMode.MultiExtended,
-			Dock = DockStyle.Fill, IntegralHeight = false,
-			TabStop = false
-		};
-		var visibleHistoryIndices = new List<int>(allHistoryIndices);
-		PopulateHistoryListBox(historyListBox, historyItems, visibleHistoryIndices);
-		AttachHistoryToolTips(historyListBox, visibleListIndex => visibleListIndex >= 0 && visibleListIndex < visibleHistoryIndices.Count ? historyItems[visibleHistoryIndices[visibleListIndex]] : null, monospaceFont);
-
-		var historyPanel = new Panel {
-			Dock = DockStyle.Fill,
-			Padding = new Padding(8, 8, 8, 4),
-			MinimumSize = new Size(HistoryPanelMinimumWidth, 0)
-		};
-		historyPanel.Controls.Add(historyListBox);
-
-		var filterTextBox = new TextBox {
-			Dock = DockStyle.Fill,
-			Margin = new Padding(0)
-		};
-		SetTextBoxPlaceholder(filterTextBox, FilterPlaceholderText);
-		var inlineOptionsHintLabel = new Label {
-			Text = "(?imnsx-imnsx)",
-			AutoSize = true,
-			BackColor = InlineOptionsHintBackColor,
-			ForeColor = InlineOptionsHintForeColor,
-			Padding = new Padding(3, 2, 3, 2),
-			Margin = new Padding(0, 0, 8, 0),
-			Cursor = Cursors.Help
-		};
-		var regexReferenceLinkLabel = new LinkLabel {
-			Text = "(Help)",
-			AutoSize = true,
-			Margin = new Padding(0),
-			TabStop = false
-		};
-		var filterHelpRow = new FlowLayoutPanel {
-			Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
-			FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, 4, 0, 2), Padding = new Padding(0)
-		};
-		filterHelpRow.Controls.Add(inlineOptionsHintLabel);
-		filterHelpRow.Controls.Add(regexReferenceLinkLabel);
-		var regexHelpToolTip = CreateMonospaceToolTip(monospaceFont, HelpToolTipAutoPopDelayMilliseconds, HelpToolTipDelayMilliseconds, HelpToolTipDelayMilliseconds);
-		regexHelpToolTip.SetToolTip(inlineOptionsHintLabel, RegexOptionsToolTipText);
-		regexHelpToolTip.SetToolTip(regexReferenceLinkLabel, ".NET Regex Reference");
-		regexReferenceLinkLabel.LinkClicked += (sender, eventArgs) => {
-			try
+		var outputBuilder = new StringBuilder();
+		for (int selectedItemPosition = 0; selectedItemPosition < selectedHistoryIndices.Count; selectedItemPosition++)
+		{
+			if (selectedItemPosition > 0)
 			{
-				Process.Start(new ProcessStartInfo(RegexReferenceUrl) { UseShellExecute = true });
+				outputBuilder.Append(separatorText);
 			}
-			catch (Exception)
+			if (isNumberedMode)
 			{
+				outputBuilder.Append(selectedItemPosition + 1).Append(itemAffixText);
 			}
-		};
-		combineHistoryForm.Disposed += (sender, eventArgs) => {
-			regexHelpToolTip.Dispose();
-		};
-		int selectionTextBoxHeight = TextRenderer.MeasureText("0", monospaceFont).Height * SelectionTextBoxMinimumLineCount + SelectionTextBoxVerticalPadding;
-		var selectionTextBox = new TextBox {
-			Dock = DockStyle.Fill,
-			Multiline = true, ScrollBars = ScrollBars.Vertical,
-			MinimumSize = new Size(0, selectionTextBoxHeight),
-			Margin = new Padding(0)
-		};
-		var resetSelectionButton = new Button {
-			Text = "Reset Selection", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
-		};
-		var restoreValidSelectionButton = new Button {
-			Text = "Restore Last Valid", Enabled = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
-		};
-		var selectionButtonRow = new FlowLayoutPanel {
-			Dock = DockStyle.Fill, AutoSize = true, WrapContents = false,
-			FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0), Padding = new Padding(0)
-		};
-		selectionButtonRow.Controls.Add(resetSelectionButton);
-		selectionButtonRow.Controls.Add(restoreValidSelectionButton);
+			else
+			{
+				outputBuilder.Append(itemAffixText);
+			}
+			outputBuilder.Append(historyItems[selectedHistoryIndices[selectedItemPosition]].Trim());
+		}
 
-		string prefixText = string.Empty;
-		string numberSuffixText = ". ";
-		bool isNumberedMode = false;
-		Action<TextBox> attachSelectAllOnKeyboardFocus = textBox => {
+		return outputBuilder.ToString();
+	}
+
+	private sealed class CombineHistoryDialogResult
+	{
+		public DialogResult DialogResult;
+		public ClipboardManagerSource CurrentSource;
+		public List<string> HistoryItems;
+		public List<int> SelectedHistoryIndices;
+		public bool IsNumberedMode;
+		public string ItemAffixText;
+		public string SeparatorText;
+	}
+
+	private sealed class CombineHistoryDialogController
+	{
+		private readonly Timer selectionUpdateTimer = new Timer { Interval = SelectionUpdateDelayMilliseconds };
+		private readonly Timer filterUpdateTimer = new Timer { Interval = FilterUpdateDelayMilliseconds };
+		private readonly Font monospaceFont = new Font("Consolas", 9f);
+		private readonly Form combineHistoryForm;
+		private readonly ToolTip regexHelpToolTip;
+		private readonly CoalescingListBox historyListBox;
+		private readonly TextBox filterTextBox;
+		private readonly TextBox selectionTextBox;
+		private readonly Button resetSelectionButton;
+		private readonly Button restoreValidSelectionButton;
+		private readonly FlowLayoutPanel selectionButtonRow;
+		private readonly Button modeToggleButton;
+		private readonly TextBox modeAffixTextBox;
+		private readonly TextBox separatorTextBox;
+		private readonly TableLayoutPanel controlsLayout;
+		private readonly ComboBox sourceSelectorComboBox;
+		private readonly Button okButton;
+		private readonly Button cancelButton;
+		private readonly FlowLayoutPanel dialogActionButtonRow;
+		private readonly TableLayoutPanel dialogFooterLayout;
+		private readonly Panel controlsPanel;
+		private readonly Splitter divider;
+		private readonly int formNonClientWidth;
+
+		private ClipboardManagerSource currentSource;
+		private List<string> historyItems;
+		private List<int> allHistoryIndices;
+		private List<int> visibleHistoryIndices;
+		private HashSet<int> selectedHistoryIndexSet = new HashSet<int>();
+		private Control[] enterNavigationOrder;
+		private string prefixText = string.Empty;
+		private string numberSuffixText = ". ";
+		private string lastValidSelectionText;
+		private bool isNumberedMode;
+		private bool isSelectionTextUpdateSuppressed;
+		private bool isListSelectionUpdateSuppressed;
+		private bool isFilterRunning;
+		private bool isSeparatorTextValid = true;
+		private int controlsPanelMinimumWidth = ControlsPanelMinimumWidth;
+		private CancellationTokenSource activeFilterCancellation;
+		private int nextFilterRequestId;
+
+		public CombineHistoryDialogController(string inputText)
+		{
+			currentSource = GetInitialClipboardManagerSource(inputText);
+			historyItems = GetClipboardManagerItems(currentSource);
+			allHistoryIndices = GetAllHistoryIndices(historyItems.Count);
+			visibleHistoryIndices = new List<int>(allHistoryIndices);
+
+			combineHistoryForm = CreateForm();
+			regexHelpToolTip = CreateMonospaceToolTip(monospaceFont, HelpToolTipAutoPopDelayMilliseconds, HelpToolTipDelayMilliseconds, HelpToolTipDelayMilliseconds);
+			combineHistoryForm.Disposed += (sender, eventArgs) => {
+				CancelActiveFilter();
+				selectionUpdateTimer.Dispose();
+				filterUpdateTimer.Dispose();
+				regexHelpToolTip.Dispose();
+				monospaceFont.Dispose();
+			};
+
+			historyListBox = CreateHistoryListBox();
+			Panel historyPanel = CreateHistoryPanel();
+			filterTextBox = CreateFilterTextBox();
+			selectionTextBox = CreateSelectionTextBox();
+			resetSelectionButton = CreateAutoSizeButton("Reset Selection", DialogResult.None, true);
+			restoreValidSelectionButton = CreateAutoSizeButton("Restore Last Valid", DialogResult.None, false);
+			selectionButtonRow = CreateSelectionButtonRow();
+			modeToggleButton = CreateModeToggleButton();
+			modeAffixTextBox = CreateModeAffixTextBox();
+			separatorTextBox = CreateSeparatorTextBox();
+			controlsLayout = CreateControlsLayout();
+			sourceSelectorComboBox = CreateSourceSelectorComboBox();
+			okButton = CreateDialogButton("OK", DialogResult.OK);
+			cancelButton = CreateDialogButton("Cancel", DialogResult.Cancel);
+			dialogActionButtonRow = CreateDialogActionButtonRow();
+			dialogFooterLayout = CreateDialogFooterLayout();
+			controlsPanel = new Panel {
+				Dock = DockStyle.Right,
+				Width = controlsPanelMinimumWidth,
+				MinimumSize = new Size(controlsPanelMinimumWidth, 0),
+				Padding = new Padding(SystemInformation.Border3DSize.Width)
+			};
+			controlsPanel.Controls.Add(controlsLayout);
+			controlsPanel.Controls.Add(dialogFooterLayout);
+			divider = CreateDivider();
+			formNonClientWidth = combineHistoryForm.Width - combineHistoryForm.ClientSize.Width;
+			combineHistoryForm.MinimumSize = new Size(HistoryPanelMinimumWidth + divider.Width + controlsPanelMinimumWidth + formNonClientWidth, combineHistoryForm.MinimumSize.Height);
+
+			UpdateModeToggleButtonText();
+			ConfigureTabOrder();
+			WireEvents();
+			AssembleForm(historyPanel);
+			UpdateControlsPanelMinimumWidth();
+			UpdateSeparatorTextState();
+			UpdateControlStates();
+			FocusControl(selectionTextBox);
+		}
+
+		public CombineHistoryDialogResult Show()
+		{
+			DialogResult dialogResult = combineHistoryForm.ShowDialog();
+			CombineHistoryDialogResult result = CreateDialogResult(dialogResult);
+			combineHistoryForm.Dispose();
+			return result;
+		}
+
+		private static Button CreateAutoSizeButton(string text, DialogResult dialogResult, bool enabled)
+		{
+			return new Button {
+				Text = text,
+				DialogResult = dialogResult,
+				Enabled = enabled,
+				AutoSize = true,
+				AutoSizeMode = AutoSizeMode.GrowAndShrink
+			};
+		}
+
+		private static Button CreateDialogButton(string text, DialogResult dialogResult)
+		{
+			var button = CreateAutoSizeButton(text, dialogResult, true);
+			button.Margin = Padding.Empty;
+			return button;
+		}
+
+		private Form CreateForm()
+		{
+			Rectangle screenWorkingArea = Screen.PrimaryScreen.WorkingArea;
+			int formWidth = Math.Max(MinimumFormWidth, screenWorkingArea.Width * InitialFormSizeRatioNumerator / InitialFormSizeRatioDenominator);
+			int formHeight = Math.Max(MinimumFormHeight, screenWorkingArea.Height * InitialFormSizeRatioNumerator / InitialFormSizeRatioDenominator);
+			return new Form {
+				Text = "Combine History",
+				Font = monospaceFont,
+				Width = formWidth,
+				Height = formHeight,
+				MinimumSize = new Size(MinimumFormWidth, MinimumFormHeight),
+				StartPosition = FormStartPosition.CenterScreen
+			};
+		}
+
+		private CoalescingListBox CreateHistoryListBox()
+		{
+			var listBox = new CoalescingListBox {
+				SelectionMode = SelectionMode.MultiExtended,
+				Dock = DockStyle.Fill,
+				IntegralHeight = false,
+				TabStop = false
+			};
+			PopulateHistoryListBox(listBox, historyItems, visibleHistoryIndices);
+			AttachHistoryToolTips(listBox, visibleListIndex => visibleListIndex >= 0 && visibleListIndex < visibleHistoryIndices.Count ? historyItems[visibleHistoryIndices[visibleListIndex]] : null, monospaceFont);
+			return listBox;
+		}
+
+		private Panel CreateHistoryPanel()
+		{
+			var historyPanel = new Panel {
+				Dock = DockStyle.Fill,
+				Padding = new Padding(8, 8, 8, 4),
+				MinimumSize = new Size(HistoryPanelMinimumWidth, 0)
+			};
+			historyPanel.Controls.Add(historyListBox);
+			return historyPanel;
+		}
+
+		private TextBox CreateFilterTextBox()
+		{
+			var textBox = new TextBox {
+				Dock = DockStyle.Fill,
+				Margin = new Padding(0)
+			};
+			SetTextBoxPlaceholder(textBox, FilterPlaceholderText);
+			return textBox;
+		}
+
+		private FlowLayoutPanel CreateFilterHelpRow()
+		{
+			var inlineOptionsHintLabel = new Label {
+				Text = "(?imnsx-imnsx)",
+				AutoSize = true,
+				BackColor = InlineOptionsHintBackColor,
+				ForeColor = InlineOptionsHintForeColor,
+				Padding = new Padding(3, 2, 3, 2),
+				Margin = new Padding(0, 0, 8, 0),
+				Cursor = Cursors.Help
+			};
+			var regexReferenceLinkLabel = new LinkLabel {
+				Text = "(Help)",
+				AutoSize = true,
+				Margin = new Padding(0),
+				TabStop = false
+			};
+			regexHelpToolTip.SetToolTip(inlineOptionsHintLabel, RegexOptionsToolTipText);
+			regexHelpToolTip.SetToolTip(regexReferenceLinkLabel, ".NET Regex Reference");
+			regexReferenceLinkLabel.LinkClicked += (sender, eventArgs) => {
+				try
+				{
+					Process.Start(new ProcessStartInfo(RegexReferenceUrl) { UseShellExecute = true });
+				}
+				catch (Exception)
+				{
+				}
+			};
+
+			var filterHelpRow = new FlowLayoutPanel {
+				Dock = DockStyle.Fill,
+				AutoSize = true,
+				WrapContents = false,
+				FlowDirection = FlowDirection.LeftToRight,
+				Margin = new Padding(0, 4, 0, 2),
+				Padding = new Padding(0)
+			};
+			filterHelpRow.Controls.Add(inlineOptionsHintLabel);
+			filterHelpRow.Controls.Add(regexReferenceLinkLabel);
+			return filterHelpRow;
+		}
+
+		private TextBox CreateSelectionTextBox()
+		{
+			int selectionTextBoxHeight = TextRenderer.MeasureText("0", monospaceFont).Height * SelectionTextBoxMinimumLineCount + SelectionTextBoxVerticalPadding;
+			return new TextBox {
+				Dock = DockStyle.Fill,
+				Multiline = true,
+				ScrollBars = ScrollBars.Vertical,
+				MinimumSize = new Size(0, selectionTextBoxHeight),
+				Margin = new Padding(0)
+			};
+		}
+
+		private FlowLayoutPanel CreateSelectionButtonRow()
+		{
+			var buttonRow = new FlowLayoutPanel {
+				Dock = DockStyle.Fill,
+				AutoSize = true,
+				WrapContents = false,
+				FlowDirection = FlowDirection.LeftToRight,
+				Margin = new Padding(0),
+				Padding = new Padding(0)
+			};
+			buttonRow.Controls.Add(resetSelectionButton);
+			buttonRow.Controls.Add(restoreValidSelectionButton);
+			return buttonRow;
+		}
+
+		private Button CreateModeToggleButton()
+		{
+			var button = new Button {
+				Text = PrefixModeButtonText,
+				AutoSize = false,
+				Dock = DockStyle.Fill,
+				TextAlign = ContentAlignment.MiddleCenter
+			};
+			regexHelpToolTip.SetToolTip(button, OutputModeToolTipText);
+			return button;
+		}
+
+		private TextBox CreateModeAffixTextBox()
+		{
+			var textBox = new TextBox {
+				Text = prefixText,
+				Anchor = AnchorStyles.Left | AnchorStyles.Right
+			};
+			AttachSelectAllOnKeyboardFocus(textBox);
+			return textBox;
+		}
+
+		private TextBox CreateSeparatorTextBox()
+		{
+			var textBox = new TextBox {
+				Text = @"\n",
+				Anchor = AnchorStyles.Left | AnchorStyles.Right
+			};
+			AttachSelectAllOnKeyboardFocus(textBox);
+			return textBox;
+		}
+
+		private TableLayoutPanel CreateControlsLayout()
+		{
+			var layout = new TableLayoutPanel {
+				Dock = DockStyle.Fill,
+				Padding = Padding.Empty,
+				ColumnCount = 2,
+				RowCount = 8
+			};
+			layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+			layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+			var filterLabel = new Label {
+				Text = "Regex (.NET):",
+				AutoSize = true,
+				Anchor = AnchorStyles.Left
+			};
+			var selectionLabel = new Label {
+				Text = "Selection:",
+				AutoSize = true,
+				Anchor = AnchorStyles.Left
+			};
+			var separatorLabel = new Label {
+				Text = "Separator:",
+				AutoSize = true,
+				Anchor = AnchorStyles.Left
+			};
+			FlowLayoutPanel filterHelpRow = CreateFilterHelpRow();
+
+			layout.Controls.Add(filterLabel, 0, 0);
+			layout.SetColumnSpan(filterLabel, 2);
+			layout.Controls.Add(filterTextBox, 0, 1);
+			layout.SetColumnSpan(filterTextBox, 2);
+			layout.Controls.Add(filterHelpRow, 0, 2);
+			layout.SetColumnSpan(filterHelpRow, 2);
+			layout.Controls.Add(selectionLabel, 0, 3);
+			layout.SetColumnSpan(selectionLabel, 2);
+			layout.Controls.Add(selectionTextBox, 0, 4);
+			layout.SetColumnSpan(selectionTextBox, 2);
+			layout.Controls.Add(selectionButtonRow, 0, 5);
+			layout.SetColumnSpan(selectionButtonRow, 2);
+			layout.Controls.Add(modeToggleButton, 0, 6);
+			layout.Controls.Add(modeAffixTextBox, 1, 6);
+			layout.Controls.Add(separatorLabel, 0, 7);
+			layout.Controls.Add(separatorTextBox, 1, 7);
+			return layout;
+		}
+
+		private ComboBox CreateSourceSelectorComboBox()
+		{
+			int sourceSelectorWidth = SourceSelectorOptions.Max(optionText => TextRenderer.MeasureText(optionText, monospaceFont).Width) + SystemInformation.VerticalScrollBarWidth + SourceSelectorWidthPadding;
+			var comboBox = new ComboBox {
+				DropDownStyle = ComboBoxStyle.DropDownList,
+				Width = sourceSelectorWidth,
+				Anchor = AnchorStyles.Left,
+				Margin = Padding.Empty
+			};
+			comboBox.Items.AddRange(SourceSelectorOptions);
+			comboBox.SelectedIndex = (int)currentSource;
+			return comboBox;
+		}
+
+		private FlowLayoutPanel CreateDialogActionButtonRow()
+		{
+			var buttonRow = new FlowLayoutPanel {
+				AutoSize = true,
+				AutoSizeMode = AutoSizeMode.GrowAndShrink,
+				WrapContents = false,
+				FlowDirection = FlowDirection.RightToLeft,
+				Anchor = AnchorStyles.Right,
+				Margin = Padding.Empty,
+				Padding = Padding.Empty
+			};
+			buttonRow.Controls.Add(cancelButton);
+			buttonRow.Controls.Add(okButton);
+			return buttonRow;
+		}
+
+		private TableLayoutPanel CreateDialogFooterLayout()
+		{
+			var layout = new TableLayoutPanel {
+				Dock = DockStyle.Bottom,
+				AutoSize = true,
+				AutoSizeMode = AutoSizeMode.GrowAndShrink,
+				Padding = Padding.Empty,
+				ColumnCount = 2,
+				RowCount = 1
+			};
+			layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+			layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+			layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+			layout.Controls.Add(sourceSelectorComboBox, 0, 0);
+			layout.Controls.Add(dialogActionButtonRow, 1, 0);
+			return layout;
+		}
+
+		private Splitter CreateDivider()
+		{
+			return new Splitter {
+				Dock = DockStyle.Right,
+				Width = 6,
+				MinSize = controlsPanelMinimumWidth,
+				MinExtra = HistoryPanelMinimumWidth,
+				TabStop = false,
+				BackColor = SystemColors.ControlDark
+			};
+		}
+
+		private void ConfigureTabOrder()
+		{
+			controlsLayout.TabIndex = 0;
+			selectionTextBox.TabIndex = 0;
+			filterTextBox.TabIndex = 1;
+			selectionButtonRow.TabIndex = 2;
+			resetSelectionButton.TabIndex = 0;
+			restoreValidSelectionButton.TabIndex = 1;
+			modeToggleButton.TabIndex = 3;
+			modeAffixTextBox.TabIndex = 4;
+			separatorTextBox.TabIndex = 5;
+			dialogFooterLayout.TabIndex = 1;
+			sourceSelectorComboBox.TabIndex = 0;
+			dialogActionButtonRow.TabIndex = 1;
+			okButton.TabIndex = 0;
+			cancelButton.TabIndex = 1;
+			enterNavigationOrder = new Control[] { selectionTextBox, filterTextBox, resetSelectionButton, restoreValidSelectionButton, modeToggleButton, modeAffixTextBox, separatorTextBox, sourceSelectorComboBox, okButton, cancelButton };
+		}
+
+		private void WireEvents()
+		{
+			WireModeEvents();
+			WireSelectionEvents();
+			WireFilterEvents();
+			WireFormEvents();
+		}
+
+		private void WireModeEvents()
+		{
+			modeAffixTextBox.TextChanged += (sender, eventArgs) => {
+				if (isNumberedMode)
+				{
+					numberSuffixText = modeAffixTextBox.Text;
+					return;
+				}
+
+				prefixText = modeAffixTextBox.Text;
+			};
+			modeToggleButton.Click += (sender, eventArgs) => {
+				isNumberedMode = !isNumberedMode;
+				modeAffixTextBox.Text = isNumberedMode ? numberSuffixText : prefixText;
+				UpdateModeToggleButtonText();
+				FocusControl(modeAffixTextBox);
+			};
+		}
+
+		private void WireSelectionEvents()
+		{
+			selectionUpdateTimer.Tick += (sender, eventArgs) => {
+				selectionUpdateTimer.Stop();
+				ApplySelectionText();
+			};
+			selectionTextBox.TextChanged += (sender, eventArgs) => {
+				if (isSelectionTextUpdateSuppressed)
+				{
+					return;
+				}
+
+				selectionUpdateTimer.Stop();
+				if (string.IsNullOrWhiteSpace(selectionTextBox.Text))
+				{
+					selectionTextBox.BackColor = SystemColors.Window;
+					return;
+				}
+
+				selectionTextBox.BackColor = SystemColors.Window;
+				selectionUpdateTimer.Start();
+			};
+			restoreValidSelectionButton.Click += (sender, eventArgs) => {
+				if (string.IsNullOrEmpty(lastValidSelectionText))
+				{
+					return;
+				}
+
+				selectionUpdateTimer.Stop();
+				SetSelectionTextBoxState(lastValidSelectionText, SelectionValidColor);
+				ApplySelectionText();
+				FocusControl(selectionTextBox);
+			};
+			resetSelectionButton.Click += (sender, eventArgs) => {
+				selectionUpdateTimer.Stop();
+				selectedHistoryIndexSet.Clear();
+				ClearSelectionText();
+				SyncHistoryListSelectionFromSet();
+				UpdateControlStates();
+				historyListBox.Focus();
+			};
+			historyListBox.SelectedIndexChanged += (sender, eventArgs) => {
+				UpdateSelectionTextFromList();
+			};
+		}
+
+		private void WireFilterEvents()
+		{
+			filterUpdateTimer.Tick += (sender, eventArgs) => {
+				RunFilter();
+			};
+			filterTextBox.TextChanged += (sender, eventArgs) => {
+				if (isFilterRunning)
+				{
+					return;
+				}
+
+				filterUpdateTimer.Stop();
+				filterTextBox.BackColor = SystemColors.Window;
+				filterUpdateTimer.Start();
+			};
+			separatorTextBox.TextChanged += (sender, eventArgs) => {
+				UpdateSeparatorTextState();
+			};
+			sourceSelectorComboBox.SelectedIndexChanged += (sender, eventArgs) => {
+				currentSource = (ClipboardManagerSource)sourceSelectorComboBox.SelectedIndex;
+				ApplyCurrentSource();
+			};
+		}
+
+		private void WireFormEvents()
+		{
+			combineHistoryForm.FormClosing += (sender, eventArgs) => {
+				CancelActiveFilter();
+			};
+			combineHistoryForm.KeyPreview = true;
+			combineHistoryForm.KeyDown += (sender, eventArgs) => {
+				HandleFormKeyDown(eventArgs);
+			};
+		}
+
+		private void AssembleForm(Panel historyPanel)
+		{
+			combineHistoryForm.CancelButton = cancelButton;
+			combineHistoryForm.Controls.Add(historyPanel);
+			combineHistoryForm.Controls.Add(divider);
+			combineHistoryForm.Controls.Add(controlsPanel);
+			combineHistoryForm.PerformLayout();
+			controlsPanel.PerformLayout();
+			controlsLayout.PerformLayout();
+			dialogFooterLayout.PerformLayout();
+		}
+
+		private CombineHistoryDialogResult CreateDialogResult(DialogResult dialogResult)
+		{
+			return new CombineHistoryDialogResult {
+				DialogResult = dialogResult,
+				CurrentSource = currentSource,
+				HistoryItems = new List<string>(historyItems),
+				SelectedHistoryIndices = selectedHistoryIndexSet.OrderBy(selectionIndex => selectionIndex).ToList(),
+				IsNumberedMode = isNumberedMode,
+				ItemAffixText = modeAffixTextBox.Text,
+				SeparatorText = separatorTextBox.Text
+			};
+		}
+
+		private void AttachSelectAllOnKeyboardFocus(TextBox textBox)
+		{
 			textBox.Enter += (sender, eventArgs) => {
 				if (Control.MouseButtons != MouseButtons.None)
 				{
@@ -951,175 +1428,46 @@ public static class ClipboardFusionHelper
 
 				textBox.SelectAll();
 			};
-		};
-		var modeAffixTextBox = new TextBox {
-			Text = prefixText,
-			Anchor = AnchorStyles.Left | AnchorStyles.Right
-		};
-		attachSelectAllOnKeyboardFocus(modeAffixTextBox);
-		var modeToggleButton = new Button {
-			Text = PrefixModeButtonText,
-			AutoSize = false,
-			Dock = DockStyle.Fill,
-			TextAlign = ContentAlignment.MiddleCenter,
-		};
-		var separatorTextBox = new TextBox {
-			Text = @"\n",
-			Anchor = AnchorStyles.Left | AnchorStyles.Right
-		};
-		attachSelectAllOnKeyboardFocus(separatorTextBox);
-		Action<Control> focusControl = control => {
+		}
+
+		private void FocusControl(Control control)
+		{
 			control.Focus();
 			if (control is TextBox textBox)
 			{
 				textBox.SelectAll();
 			}
-		};
+		}
 
-		Action updateModeToggleButtonText = () => {
+		private void UpdateModeToggleButtonText()
+		{
 			modeToggleButton.Text = isNumberedMode ? NumberedModeButtonText : PrefixModeButtonText;
-		};
-		modeAffixTextBox.TextChanged += (sender, eventArgs) => {
-			if (isNumberedMode)
-			{
-				numberSuffixText = modeAffixTextBox.Text;
-				return;
-			}
+		}
 
-			prefixText = modeAffixTextBox.Text;
-		};
-		modeToggleButton.Click += (sender, eventArgs) => {
-			isNumberedMode = !isNumberedMode;
-			modeAffixTextBox.Text = isNumberedMode ? numberSuffixText : prefixText;
-			updateModeToggleButtonText();
-			focusControl(modeAffixTextBox);
-		};
-		updateModeToggleButtonText();
-		regexHelpToolTip.SetToolTip(modeToggleButton, OutputModeToolTipText);
-
-		var controlsLayout = new TableLayoutPanel {
-			Dock = DockStyle.Fill,
-			Padding = Padding.Empty,
-			ColumnCount = 2, RowCount = 8
-		};
-		controlsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-		controlsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-		var filterLabel = new Label {
-			Text = "Regex (.NET):", AutoSize = true, Anchor = AnchorStyles.Left
-		};
-		var selectionLabel = new Label {
-			Text = "Selection:", AutoSize = true, Anchor = AnchorStyles.Left
-		};
-		var separatorLabel = new Label {
-			Text = "Separator:", AutoSize = true, Anchor = AnchorStyles.Left
-		};
-		controlsLayout.Controls.Add(filterLabel, 0, 0);
-		controlsLayout.SetColumnSpan(filterLabel, 2);
-		controlsLayout.Controls.Add(filterTextBox, 0, 1);
-		controlsLayout.SetColumnSpan(filterTextBox, 2);
-		controlsLayout.Controls.Add(filterHelpRow, 0, 2);
-		controlsLayout.SetColumnSpan(filterHelpRow, 2);
-		controlsLayout.Controls.Add(selectionLabel, 0, 3);
-		controlsLayout.SetColumnSpan(selectionLabel, 2);
-		controlsLayout.Controls.Add(selectionTextBox, 0, 4);
-		controlsLayout.SetColumnSpan(selectionTextBox, 2);
-		controlsLayout.Controls.Add(selectionButtonRow, 0, 5);
-		controlsLayout.SetColumnSpan(selectionButtonRow, 2);
-		controlsLayout.Controls.Add(modeToggleButton, 0, 6);
-		controlsLayout.Controls.Add(modeAffixTextBox, 1, 6);
-		controlsLayout.Controls.Add(separatorLabel, 0, 7);
-		controlsLayout.Controls.Add(separatorTextBox, 1, 7);
-		int sourceSelectorWidth = SourceSelectorOptions.Max(optionText => TextRenderer.MeasureText(optionText, monospaceFont).Width) + SystemInformation.VerticalScrollBarWidth + SourceSelectorWidthPadding;
-		var sourceSelectorComboBox = new ComboBox {
-			DropDownStyle = ComboBoxStyle.DropDownList,
-			Width = sourceSelectorWidth,
-			Anchor = AnchorStyles.Left,
-			Margin = Padding.Empty
-		};
-		sourceSelectorComboBox.Items.AddRange(SourceSelectorOptions);
-		sourceSelectorComboBox.SelectedIndex = (int)currentSource;
-
-		var okButton = new Button {
-			Text = "OK", DialogResult = DialogResult.OK, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-			Margin = Padding.Empty
-		};
-		var cancelButton = new Button {
-			Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-			Margin = Padding.Empty
-		};
-		var dialogActionButtonRow = new FlowLayoutPanel {
-			AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false,
-			FlowDirection = FlowDirection.RightToLeft, Anchor = AnchorStyles.Right,
-			Margin = Padding.Empty,
-			Padding = Padding.Empty
-		};
-		dialogActionButtonRow.Controls.Add(cancelButton);
-		dialogActionButtonRow.Controls.Add(okButton);
-		var dialogFooterLayout = new TableLayoutPanel {
-			Dock = DockStyle.Bottom, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-			Padding = Padding.Empty,
-			ColumnCount = 2, RowCount = 1
-		};
-		dialogFooterLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-		dialogFooterLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-		dialogFooterLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-		dialogFooterLayout.Controls.Add(sourceSelectorComboBox, 0, 0);
-		dialogFooterLayout.Controls.Add(dialogActionButtonRow, 1, 0);
-		int controlsPanelMinimumWidth = ControlsPanelMinimumWidth;
-
-		var controlsPanel = new Panel { Dock = DockStyle.Right, Width = controlsPanelMinimumWidth, MinimumSize = new Size(controlsPanelMinimumWidth, 0), Padding = new Padding(SystemInformation.Border3DSize.Width) };
-		controlsPanel.Controls.Add(controlsLayout);
-		controlsPanel.Controls.Add(dialogFooterLayout);
-
-		var divider = new Splitter {
-			Dock = DockStyle.Right,
-			Width = 6,
-			MinSize = controlsPanelMinimumWidth,
-			MinExtra = HistoryPanelMinimumWidth,
-			TabStop = false,
-			BackColor = SystemColors.ControlDark
-		};
-		int formNonClientWidth = combineHistoryForm.Width - combineHistoryForm.ClientSize.Width;
-		combineHistoryForm.MinimumSize = new Size(HistoryPanelMinimumWidth + divider.Width + controlsPanelMinimumWidth + formNonClientWidth, combineHistoryForm.MinimumSize.Height);
-
-		string lastValidSelectionText = null;
-		var selectionUpdateTimer = new Timer { Interval = SelectionUpdateDelayMilliseconds };
-		var filterUpdateTimer = new Timer { Interval = FilterUpdateDelayMilliseconds };
-		bool isSelectionTextUpdateSuppressed = false;
-		bool isListSelectionUpdateSuppressed = false;
-		bool isFilterRunning = false;
-		bool isSeparatorTextValid = true;
-		var selectedHistoryIndexSet = new HashSet<int>();
-		CancellationTokenSource activeFilterCancellation = null;
-		int nextFilterRequestId = 0;
-
-		Action<string, Color> setSelectionTextBoxState = (text, backColor) => {
+		private void SetSelectionTextBoxState(string text, Color backColor)
+		{
 			isSelectionTextUpdateSuppressed = true;
 			selectionTextBox.Text = text;
 			selectionTextBox.BackColor = backColor;
 			isSelectionTextUpdateSuppressed = false;
-		};
-		Action clearSelectionText = () => {
-			setSelectionTextBoxState(string.Empty, SystemColors.Window);
-		};
-		Action updateControlsPanelMinimumWidth = () => {
+		}
+
+		private void ClearSelectionText()
+		{
+			SetSelectionTextBoxState(string.Empty, SystemColors.Window);
+		}
+
+		private void UpdateControlsPanelMinimumWidth()
+		{
 			controlsPanelMinimumWidth = Math.Max(ControlsPanelMinimumWidth, Math.Max(controlsLayout.GetPreferredSize(Size.Empty).Width, dialogFooterLayout.GetPreferredSize(Size.Empty).Width) + ControlsPanelWidthPadding);
 			controlsPanel.Width = controlsPanelMinimumWidth;
 			controlsPanel.MinimumSize = new Size(controlsPanelMinimumWidth, 0);
 			divider.MinSize = controlsPanelMinimumWidth;
 			combineHistoryForm.MinimumSize = new Size(HistoryPanelMinimumWidth + divider.Width + controlsPanelMinimumWidth + formNonClientWidth, combineHistoryForm.MinimumSize.Height);
-		};
+		}
 
-		Action updateControlStates = () => {
+		private void UpdateControlStates()
+		{
 			bool hasLastValidSelection = !string.IsNullOrEmpty(lastValidSelectionText);
 			filterTextBox.ReadOnly = isFilterRunning;
 			sourceSelectorComboBox.Enabled = !isFilterRunning;
@@ -1132,14 +1480,18 @@ public static class ClipboardFusionHelper
 			separatorTextBox.Enabled = !isFilterRunning;
 			okButton.Enabled = !isFilterRunning && isSeparatorTextValid;
 			divider.Enabled = !isFilterRunning;
-		};
-		Action updateSeparatorTextState = () => {
+		}
+
+		private void UpdateSeparatorTextState()
+		{
 			string unescapedSeparatorText;
 			isSeparatorTextValid = TryUnescapeSeparatorText(separatorTextBox.Text, out unescapedSeparatorText);
 			separatorTextBox.BackColor = isSeparatorTextValid ? SystemColors.Window : FilterInvalidColor;
-			updateControlStates();
-		};
-		Action cancelActiveFilter = () => {
+			UpdateControlStates();
+		}
+
+		private void CancelActiveFilter()
+		{
 			if (activeFilterCancellation == null)
 			{
 				return;
@@ -1148,8 +1500,10 @@ public static class ClipboardFusionHelper
 			activeFilterCancellation.Cancel();
 			activeFilterCancellation.Dispose();
 			activeFilterCancellation = null;
-		};
-		Action syncHistoryListSelectionFromSet = () => {
+		}
+
+		private void SyncHistoryListSelectionFromSet()
+		{
 			isListSelectionUpdateSuppressed = true;
 			historyListBox.BeginUpdate();
 			historyListBox.ClearSelected();
@@ -1162,52 +1516,59 @@ public static class ClipboardFusionHelper
 			}
 			historyListBox.EndUpdate();
 			isListSelectionUpdateSuppressed = false;
-		};
-		Action updateSelectionTextFromSet = () => {
+		}
+
+		private void UpdateSelectionTextFromSet()
+		{
 			var selectedHistoryIndices = selectedHistoryIndexSet.OrderBy(selectionIndex => selectionIndex).ToList();
 			if (selectedHistoryIndices.Count == 0)
 			{
-				setSelectionTextBoxState(string.Empty, SystemColors.Window);
+				SetSelectionTextBoxState(string.Empty, SystemColors.Window);
 			}
 			else
 			{
 				lastValidSelectionText = FormatSelectionText(selectedHistoryIndices);
-				setSelectionTextBoxState(lastValidSelectionText, SelectionValidColor);
+				SetSelectionTextBoxState(lastValidSelectionText, SelectionValidColor);
 			}
-			updateControlStates();
-		};
-		Action applyVisibleFilterResults = () => {
+
+			UpdateControlStates();
+		}
+
+		private void ApplyVisibleFilterResults()
+		{
 			isListSelectionUpdateSuppressed = true;
 			PopulateHistoryListBox(historyListBox, historyItems, visibleHistoryIndices);
 			isListSelectionUpdateSuppressed = false;
-			syncHistoryListSelectionFromSet();
-		};
-		Action runFilter = () => {
+			SyncHistoryListSelectionFromSet();
+		}
+
+		private void RunFilter()
+		{
 			filterUpdateTimer.Stop();
 			Func<string, bool> filterMatcher;
 			FilterPreparationStatus filterStatus = TryPrepareFilterMatcher(filterTextBox.Text, out filterMatcher);
 			if (filterStatus == FilterPreparationStatus.Empty)
 			{
-				cancelActiveFilter();
+				CancelActiveFilter();
 				visibleHistoryIndices = new List<int>(allHistoryIndices);
 				filterTextBox.BackColor = SystemColors.Window;
 				isFilterRunning = false;
-				applyVisibleFilterResults();
-				updateControlStates();
+				ApplyVisibleFilterResults();
+				UpdateControlStates();
 				return;
 			}
 			if (filterStatus == FilterPreparationStatus.Invalid)
 			{
 				filterTextBox.BackColor = FilterInvalidColor;
 				isFilterRunning = false;
-				updateControlStates();
+				UpdateControlStates();
 				return;
 			}
 
-			cancelActiveFilter();
+			CancelActiveFilter();
 			isFilterRunning = true;
 			filterTextBox.BackColor = FilterBusyColor;
-			updateControlStates();
+			UpdateControlStates();
 			int filterRequestId = ++nextFilterRequestId;
 			activeFilterCancellation = new CancellationTokenSource();
 			activeFilterCancellation.CancelAfter(FilterCancellationDelayMilliseconds);
@@ -1228,52 +1589,54 @@ public static class ClipboardFusionHelper
 						}
 
 						isFilterRunning = false;
-						cancelActiveFilter();
+						CancelActiveFilter();
 						FilterExecutionResult filterResult = filterTask.Result;
 						if (filterResult.TimedOut || filterResult.VisibleHistoryIndices == null)
 						{
 							filterTextBox.BackColor = FilterWarningColor;
-							updateControlStates();
+							UpdateControlStates();
 							return;
 						}
 
 						visibleHistoryIndices = filterResult.VisibleHistoryIndices;
 						filterTextBox.BackColor = FilterValidColor;
-						applyVisibleFilterResults();
-						updateControlStates();
+						ApplyVisibleFilterResults();
+						UpdateControlStates();
 					}));
 				}
 				catch (InvalidOperationException)
 				{
 				}
 			});
-		};
+		}
 
-		Action applyCurrentSource = () => {
-			cancelActiveFilter();
+		private void ApplyCurrentSource()
+		{
+			CancelActiveFilter();
 			selectionUpdateTimer.Stop();
 			historyItems = GetClipboardManagerItems(currentSource);
 			allHistoryIndices = GetAllHistoryIndices(historyItems.Count);
 			visibleHistoryIndices = new List<int>(allHistoryIndices);
 			selectedHistoryIndexSet.Clear();
 			lastValidSelectionText = null;
-			clearSelectionText();
+			ClearSelectionText();
 
 			Func<string, bool> filterMatcher;
 			FilterPreparationStatus filterStatus = TryPrepareFilterMatcher(filterTextBox.Text, out filterMatcher);
 			if (filterStatus == FilterPreparationStatus.Ready)
 			{
-				runFilter();
+				RunFilter();
 				return;
 			}
 
 			filterTextBox.BackColor = filterStatus == FilterPreparationStatus.Invalid ? FilterInvalidColor : SystemColors.Window;
 			isFilterRunning = false;
-			applyVisibleFilterResults();
-			updateControlStates();
-		};
+			ApplyVisibleFilterResults();
+			UpdateControlStates();
+		}
 
-		Action updateSelectionTextFromList = () => {
+		private void UpdateSelectionTextFromList()
+		{
 			if (isListSelectionUpdateSuppressed)
 			{
 				return;
@@ -1288,10 +1651,11 @@ public static class ClipboardFusionHelper
 				selectedHistoryIndexSet.Add(visibleHistoryIndices[selectedVisibleListIndex]);
 			}
 
-			updateSelectionTextFromSet();
-		};
+			UpdateSelectionTextFromSet();
+		}
 
-		Action applySelectionText = () => {
+		private void ApplySelectionText()
+		{
 			if (isSelectionTextUpdateSuppressed)
 			{
 				return;
@@ -1309,98 +1673,19 @@ public static class ClipboardFusionHelper
 			if (!TryParseSelectionText(selectionText, historyItems.Count, out parsedSelectionIndices, out normalizedSelectionText))
 			{
 				selectionTextBox.BackColor = SelectionInvalidColor;
-				updateControlStates();
+				UpdateControlStates();
 				return;
 			}
 
 			selectionTextBox.BackColor = SelectionValidColor;
 			lastValidSelectionText = normalizedSelectionText;
 			selectedHistoryIndexSet = new HashSet<int>(parsedSelectionIndices);
-			syncHistoryListSelectionFromSet();
-			updateControlStates();
-		};
+			SyncHistoryListSelectionFromSet();
+			UpdateControlStates();
+		}
 
-		selectionUpdateTimer.Tick += (sender, eventArgs) => {
-			selectionUpdateTimer.Stop();
-			applySelectionText();
-		};
-		selectionTextBox.TextChanged += (sender, eventArgs) => {
-			if (isSelectionTextUpdateSuppressed)
-			{
-				return;
-			}
-
-			selectionUpdateTimer.Stop();
-			if (string.IsNullOrWhiteSpace(selectionTextBox.Text))
-			{
-				selectionTextBox.BackColor = SystemColors.Window;
-				return;
-			}
-
-			selectionTextBox.BackColor = SystemColors.Window;
-			selectionUpdateTimer.Start();
-		};
-		restoreValidSelectionButton.Click += (sender, eventArgs) => {
-			if (string.IsNullOrEmpty(lastValidSelectionText))
-			{
-				return;
-			}
-
-			selectionUpdateTimer.Stop();
-			setSelectionTextBoxState(lastValidSelectionText, SelectionValidColor);
-			applySelectionText();
-			focusControl(selectionTextBox);
-		};
-		resetSelectionButton.Click += (sender, eventArgs) => {
-			selectionUpdateTimer.Stop();
-			selectedHistoryIndexSet.Clear();
-			clearSelectionText();
-			syncHistoryListSelectionFromSet();
-			updateControlStates();
-			historyListBox.Focus();
-		};
-		filterUpdateTimer.Tick += (sender, eventArgs) => {
-			runFilter();
-		};
-		filterTextBox.TextChanged += (sender, eventArgs) => {
-			if (isFilterRunning)
-			{
-				return;
-			}
-
-			filterUpdateTimer.Stop();
-			filterTextBox.BackColor = SystemColors.Window;
-			filterUpdateTimer.Start();
-		};
-		separatorTextBox.TextChanged += (sender, eventArgs) => {
-			updateSeparatorTextState();
-		};
-		sourceSelectorComboBox.SelectedIndexChanged += (sender, eventArgs) => {
-			currentSource = (ClipboardManagerSource)sourceSelectorComboBox.SelectedIndex;
-			applyCurrentSource();
-		};
-		combineHistoryForm.FormClosing += (sender, eventArgs) => {
-			cancelActiveFilter();
-		};
-
-		controlsLayout.TabIndex = 0;
-		selectionTextBox.TabIndex = 0;
-		filterTextBox.TabIndex = 1;
-		selectionButtonRow.TabIndex = 2;
-		resetSelectionButton.TabIndex = 0;
-		restoreValidSelectionButton.TabIndex = 1;
-		modeToggleButton.TabIndex = 3;
-		modeAffixTextBox.TabIndex = 4;
-		separatorTextBox.TabIndex = 5;
-		dialogFooterLayout.TabIndex = 1;
-		sourceSelectorComboBox.TabIndex = 0;
-		dialogActionButtonRow.TabIndex = 1;
-		okButton.TabIndex = 0;
-		cancelButton.TabIndex = 1;
-
-		Control[] enterNavigationOrder = new Control[] { selectionTextBox, filterTextBox, resetSelectionButton, restoreValidSelectionButton, modeToggleButton, modeAffixTextBox, separatorTextBox, sourceSelectorComboBox, okButton, cancelButton };
-		combineHistoryForm.KeyPreview = true;
-		combineHistoryForm.KeyDown += (sender, eventArgs) => {
+		private void HandleFormKeyDown(KeyEventArgs eventArgs)
+		{
 			if (eventArgs.KeyCode == Keys.Enter && eventArgs.Control)
 			{
 				eventArgs.SuppressKeyPress = true;
@@ -1433,78 +1718,51 @@ public static class ClipboardFusionHelper
 				modeToggleButton.PerformClick();
 				eventArgs.SuppressKeyPress = true;
 				eventArgs.Handled = true;
-				focusControl(modeAffixTextBox);
+				FocusControl(modeAffixTextBox);
 				return;
 			}
 
 			int focusedControlIndex = Array.IndexOf(enterNavigationOrder, focusedControl);
-			if (focusedControlIndex >= 0)
+			if (focusedControlIndex < 0)
 			{
-				eventArgs.SuppressKeyPress = true;
-				eventArgs.Handled = true;
-				for (int navigationOffset = 1; navigationOffset <= enterNavigationOrder.Length; navigationOffset++)
+				return;
+			}
+
+			eventArgs.SuppressKeyPress = true;
+			eventArgs.Handled = true;
+			for (int navigationOffset = 1; navigationOffset <= enterNavigationOrder.Length; navigationOffset++)
+			{
+				Control nextControl = enterNavigationOrder[(focusedControlIndex + navigationOffset) % enterNavigationOrder.Length];
+				if (nextControl.Enabled && nextControl.Visible && nextControl.TabStop)
 				{
-					Control nextControl = enterNavigationOrder[(focusedControlIndex + navigationOffset) % enterNavigationOrder.Length];
-					if (nextControl.Enabled && nextControl.Visible && nextControl.TabStop)
-					{
-						focusControl(nextControl);
-						break;
-					}
+					FocusControl(nextControl);
+					break;
 				}
 			}
-		};
+		}
+	}
 
-		combineHistoryForm.CancelButton = cancelButton;
-		combineHistoryForm.Controls.Add(historyPanel);
-		combineHistoryForm.Controls.Add(divider);
-		combineHistoryForm.Controls.Add(controlsPanel);
-		combineHistoryForm.PerformLayout();
-		controlsPanel.PerformLayout();
-		controlsLayout.PerformLayout();
-		dialogFooterLayout.PerformLayout();
-		updateControlsPanelMinimumWidth();
+	private static CombineHistoryDialogResult ShowCombineHistoryDialog(string inputText)
+	{
+		return new CombineHistoryDialogController(inputText).Show();
+	}
 
-		historyListBox.SelectedIndexChanged += (sender, eventArgs) => {
-			updateSelectionTextFromList();
-		};
-		updateSeparatorTextState();
-		updateControlStates();
-		focusControl(selectionTextBox);
+	public static string ProcessText(string inputText)
+	{
+		CombineHistoryDialogResult dialogResult = ShowCombineHistoryDialog(inputText);
+		SaveRememberedClipboardManagerSource(dialogResult.CurrentSource);
 
-		DialogResult dialogResult = combineHistoryForm.ShowDialog();
-		SaveRememberedClipboardManagerSource(currentSource);
-
-		if (dialogResult != DialogResult.OK)
+		if (dialogResult.DialogResult != DialogResult.OK)
 		{
 			return null;
 		}
 
-		var selectedHistoryIndices = selectedHistoryIndexSet.OrderBy(selectionIndex => selectionIndex).ToList();
-		string itemAffixText = modeAffixTextBox.Text;
 		string separatorText;
-		if (!TryUnescapeSeparatorText(separatorTextBox.Text, out separatorText))
+		if (!TryUnescapeSeparatorText(dialogResult.SeparatorText, out separatorText))
 		{
 			return null;
 		}
-		var outputBuilder = new StringBuilder();
-		for (int selectedItemPosition = 0; selectedItemPosition < selectedHistoryIndices.Count; selectedItemPosition++)
-		{
-			if (selectedItemPosition > 0)
-			{
-				outputBuilder.Append(separatorText);
-			}
-			if (isNumberedMode)
-			{
-				outputBuilder.Append(selectedItemPosition + 1).Append(itemAffixText);
-			}
-			else
-			{
-				outputBuilder.Append(itemAffixText);
-			}
-			outputBuilder.Append(historyItems[selectedHistoryIndices[selectedItemPosition]].Trim());
-		}
-
-		string combinedResult = outputBuilder.ToString();
+		string combinedResult = BuildCombinedResult(dialogResult.HistoryItems, dialogResult.SelectedHistoryIndices, dialogResult.IsNumberedMode, dialogResult.ItemAffixText, separatorText);
 		BFS.Clipboard.SetText(combinedResult);
 		return combinedResult;
 	}
