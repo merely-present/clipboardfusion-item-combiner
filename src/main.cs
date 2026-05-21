@@ -65,7 +65,7 @@ public static class ClipboardFusionHelper
 	private const int SourceSelectorWidthPadding = 24;
 	private const int ControlsPanelWidthPadding = 8;
 
-	private const int SelectionUpdateDelayMilliseconds = 150;
+	private const int SelectionUpdateDelayMilliseconds = 10;
 	private const int FilterUpdateDelayMilliseconds = 250;
 	private const int FilterCancellationDelayMilliseconds = 3000;
 	private const int FilterRegexTimeoutSeconds = 1;
@@ -78,7 +78,8 @@ public static class ClipboardFusionHelper
 	private const int ToolTipMaximumWidth = 720;
 	private const int ToolTipPadding = 8;
 	private const int ToolTipTextInset = 4;
-	private const int ToolTipWrapLineLength = 100;
+	private const string ToolTipNewLinePrefix = "+|";
+	private const string ToolTipContinuationPrefix = " |";
 
 	private const RegexOptions DefaultFilterRegexOptions = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Singleline;
 	private const string FilterPlaceholderText = "Default: IgnoreCase + Singleline";
@@ -123,6 +124,7 @@ public static class ClipboardFusionHelper
 		{ "onlinepinned", ClipboardManagerSource.OnlinePinned }
 	};
 	private static readonly TextFormatFlags ToolTipTextFormat = TextFormatFlags.Left | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak;
+	private static readonly TextFormatFlags ToolTipSingleLineTextFormat = TextFormatFlags.Left | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
 	private static readonly Color InlineOptionsHintBackColor = Color.FromArgb(255, 248, 214);
 	private static readonly Color InlineOptionsHintForeColor = Color.FromArgb(118, 101, 43);
 	private static readonly Color SelectionValidColor = Color.FromArgb(230, 255, 230);
@@ -471,7 +473,7 @@ public static class ClipboardFusionHelper
 	}
 
 	// Match Clipboard Manager preview placement: sit flush to the row on the left when possible,
-	// otherwise flip to the right while keeping the current vertical centering.
+	// otherwise flip to the right, and fall back to centered when neither side has room.
 	private static Point GetHistoryToolTipLocation(ListBox historyListBox, int hoverIndex, Size toolTipSize)
 	{
 		Rectangle itemBounds = historyListBox.GetItemRectangle(hoverIndex);
@@ -493,12 +495,44 @@ public static class ClipboardFusionHelper
 		}
 		else
 		{
-			toolTipScreenX = Math.Max(screenBounds.Left, Math.Min(maximumScreenX, leftScreenX));
+			toolTipScreenX = screenBounds.Left + (maximumScreenX - screenBounds.Left) / 2;
 		}
 
 		Point rowCenterScreenLocation = historyListBox.PointToScreen(new Point(0, itemBounds.Top + (itemBounds.Height - toolTipSize.Height) / 2));
 		int toolTipScreenY = Math.Max(screenBounds.Top, Math.Min(maximumScreenY, rowCenterScreenLocation.Y));
 		return historyListBox.PointToClient(new Point(toolTipScreenX, toolTipScreenY));
+	}
+
+	private static int MeasureToolTipLineWidth(string toolTipLineText, Font toolTipFont)
+	{
+		return TextRenderer.MeasureText(toolTipLineText ?? string.Empty, toolTipFont, Size.Empty, ToolTipSingleLineTextFormat).Width;
+	}
+
+	private static bool DoesToolTipLineFit(string linePrefix, string lineContent, Font toolTipFont, int maximumLineWidth)
+	{
+		return MeasureToolTipLineWidth(linePrefix + lineContent, toolTipFont) <= maximumLineWidth;
+	}
+
+	private static int FindLongestToolTipSegmentLength(string lineWord, int startIndex, string linePrefix, Font toolTipFont, int maximumLineWidth)
+	{
+		int longestSegmentLength = 1;
+		int lowerBound = 1;
+		int upperBound = lineWord.Length - startIndex;
+		while (lowerBound <= upperBound)
+		{
+			int candidateSegmentLength = lowerBound + (upperBound - lowerBound) / 2;
+			if (DoesToolTipLineFit(linePrefix, lineWord.Substring(startIndex, candidateSegmentLength), toolTipFont, maximumLineWidth))
+			{
+				longestSegmentLength = candidateSegmentLength;
+				lowerBound = candidateSegmentLength + 1;
+			}
+			else
+			{
+				upperBound = candidateSegmentLength - 1;
+			}
+		}
+
+		return longestSegmentLength;
 	}
 
 	private static void AttachHistoryToolTips(ListBox historyListBox, Func<int, string> getHistoryItemText, Font toolTipFont)
@@ -540,7 +574,7 @@ public static class ClipboardFusionHelper
 				fullTooltipText = fullTooltipText.Substring(0, MaximumToolTipTextLength);
 			}
 
-			return WrapTooltipText(fullTooltipText, ToolTipWrapLineLength);
+			return WrapTooltipText(fullTooltipText, toolTipFont, ToolTipMaximumWidth);
 		};
 		Action<Point> scheduleHistoryToolTip = cursorLocation => {
 			int hoverIndex = historyListBox.IndexFromPoint(cursorLocation);
@@ -742,55 +776,70 @@ public static class ClipboardFusionHelper
 		return true;
 	}
 
-	private static string WrapTooltipText(string tooltipText, int maxContentLineLength)
+	private static string WrapTooltipText(string tooltipText, Font toolTipFont, int maximumLineWidth)
 	{
-		if (string.IsNullOrEmpty(tooltipText) || maxContentLineLength < 1)
+		if (string.IsNullOrEmpty(tooltipText) || toolTipFont == null || maximumLineWidth < 1)
 		{
 			return tooltipText;
 		}
 
 		string[] sourceLines = tooltipText.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-		var wrappedTooltipText = new StringBuilder();
+		var wrappedLines = new List<string>();
 		for (int sourceLineIndex = 0; sourceLineIndex < sourceLines.Length; sourceLineIndex++)
 		{
 			string sourceLine = sourceLines[sourceLineIndex];
-			if (sourceLineIndex > 0)
-			{
-				wrappedTooltipText.Append('\n');
-			}
 			if (sourceLine.Length == 0)
 			{
-				wrappedTooltipText.Append('+');
+				wrappedLines.Add(ToolTipNewLinePrefix);
 				continue;
 			}
 
 			string[] lineWords = sourceLine.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-			wrappedTooltipText.Append('+');
-			int currentLineLength = 0;
+			string currentLinePrefix = ToolTipNewLinePrefix;
+			var currentLineContent = new StringBuilder();
 			for (int wordIndex = 0; wordIndex < lineWords.Length; wordIndex++)
 			{
 				string lineWord = lineWords[wordIndex];
-				if (currentLineLength > 0 && currentLineLength + 1 + lineWord.Length > maxContentLineLength)
+				if (currentLineContent.Length > 0)
 				{
-					wrappedTooltipText.Append('\n');
-					wrappedTooltipText.Append(' ');
-					wrappedTooltipText.Append(lineWord);
-					currentLineLength = lineWord.Length;
-				}
-				else
-				{
-					if (currentLineLength > 0)
+					string appendedLineContent = currentLineContent + " " + lineWord;
+					if (DoesToolTipLineFit(currentLinePrefix, appendedLineContent, toolTipFont, maximumLineWidth))
 					{
-						wrappedTooltipText.Append(' ');
-						currentLineLength++;
+						currentLineContent.Append(' ');
+						currentLineContent.Append(lineWord);
+						continue;
 					}
-					wrappedTooltipText.Append(lineWord);
-					currentLineLength += lineWord.Length;
+
+					wrappedLines.Add(currentLinePrefix + currentLineContent);
+					currentLinePrefix = ToolTipContinuationPrefix;
+					currentLineContent.Clear();
+				}
+
+				if (DoesToolTipLineFit(currentLinePrefix, lineWord, toolTipFont, maximumLineWidth))
+				{
+					currentLineContent.Append(lineWord);
+					continue;
+				}
+
+				int wordOffset = 0;
+				while (wordOffset < lineWord.Length)
+				{
+					int segmentLength = FindLongestToolTipSegmentLength(lineWord, wordOffset, currentLinePrefix, toolTipFont, maximumLineWidth);
+					currentLineContent.Append(lineWord, wordOffset, segmentLength);
+					wordOffset += segmentLength;
+					if (wordOffset < lineWord.Length)
+					{
+						wrappedLines.Add(currentLinePrefix + currentLineContent);
+						currentLinePrefix = ToolTipContinuationPrefix;
+						currentLineContent.Clear();
+					}
 				}
 			}
+
+			wrappedLines.Add(currentLinePrefix + currentLineContent);
 		}
 
-		return wrappedTooltipText.ToString();
+		return string.Join("\n", wrappedLines);
 	}
 
 	public static string ProcessText(string inputText)
@@ -892,26 +941,33 @@ public static class ClipboardFusionHelper
 
 		string prefixText = string.Empty;
 		string numberSuffixText = ". ";
+		bool isNumberedMode = false;
+		Action<TextBox> attachSelectAllOnKeyboardFocus = textBox => {
+			textBox.Enter += (sender, eventArgs) => {
+				if (Control.MouseButtons != MouseButtons.None)
+				{
+					return;
+				}
+
+				textBox.SelectAll();
+			};
+		};
 		var modeAffixTextBox = new TextBox {
-			Text = prefixText, Dock = DockStyle.Fill
+			Text = prefixText,
+			Anchor = AnchorStyles.Left | AnchorStyles.Right
 		};
-		var modeToggleButton = new CheckBox {
+		attachSelectAllOnKeyboardFocus(modeAffixTextBox);
+		var modeToggleButton = new Button {
 			Text = PrefixModeButtonText,
-			Appearance = Appearance.Button,
-			AutoSize = true,
-			TextAlign = ContentAlignment.MiddleCenter
+			AutoSize = false,
+			Dock = DockStyle.Fill,
+			TextAlign = ContentAlignment.MiddleCenter,
 		};
-		Size prefixModeToggleButtonSize = modeToggleButton.GetPreferredSize(Size.Empty);
-		modeToggleButton.Text = NumberedModeButtonText;
-		Size numberedModeToggleButtonSize = modeToggleButton.GetPreferredSize(Size.Empty);
-		modeToggleButton.Text = PrefixModeButtonText;
-		modeToggleButton.AutoSize = false;
-		modeToggleButton.Size = new Size(
-			Math.Max(prefixModeToggleButtonSize.Width, numberedModeToggleButtonSize.Width),
-			Math.Max(prefixModeToggleButtonSize.Height, numberedModeToggleButtonSize.Height));
 		var separatorTextBox = new TextBox {
-			Text = @"\n", Dock = DockStyle.Fill
+			Text = @"\n",
+			Anchor = AnchorStyles.Left | AnchorStyles.Right
 		};
+		attachSelectAllOnKeyboardFocus(separatorTextBox);
 		Action<Control> focusControl = control => {
 			control.Focus();
 			if (control is TextBox textBox)
@@ -921,10 +977,10 @@ public static class ClipboardFusionHelper
 		};
 
 		Action updateModeToggleButtonText = () => {
-			modeToggleButton.Text = modeToggleButton.Checked ? NumberedModeButtonText : PrefixModeButtonText;
+			modeToggleButton.Text = isNumberedMode ? NumberedModeButtonText : PrefixModeButtonText;
 		};
 		modeAffixTextBox.TextChanged += (sender, eventArgs) => {
-			if (modeToggleButton.Checked)
+			if (isNumberedMode)
 			{
 				numberSuffixText = modeAffixTextBox.Text;
 				return;
@@ -932,8 +988,9 @@ public static class ClipboardFusionHelper
 
 			prefixText = modeAffixTextBox.Text;
 		};
-		modeToggleButton.CheckedChanged += (sender, eventArgs) => {
-			modeAffixTextBox.Text = modeToggleButton.Checked ? numberSuffixText : prefixText;
+		modeToggleButton.Click += (sender, eventArgs) => {
+			isNumberedMode = !isNumberedMode;
+			modeAffixTextBox.Text = isNumberedMode ? numberSuffixText : prefixText;
 			updateModeToggleButtonText();
 			focusControl(modeAffixTextBox);
 		};
@@ -941,7 +998,8 @@ public static class ClipboardFusionHelper
 		regexHelpToolTip.SetToolTip(modeToggleButton, OutputModeToolTipText);
 
 		var controlsLayout = new TableLayoutPanel {
-			Dock = DockStyle.Fill, Padding = new Padding(12, 10, 12, 6),
+			Dock = DockStyle.Fill,
+			Padding = Padding.Empty,
 			ColumnCount = 2, RowCount = 8
 		};
 		controlsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -955,14 +1013,14 @@ public static class ClipboardFusionHelper
 		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 		controlsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-		Padding labelMargin = new Padding(0, 4, 6, 0);
 		var filterLabel = new Label {
-			Text = "Regex (.NET):", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Top,
-			Margin = new Padding(0, 0, 0, 2)
+			Text = "Regex (.NET):", AutoSize = true, Anchor = AnchorStyles.Left
 		};
 		var selectionLabel = new Label {
-			Text = "Selection:", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Top,
-			Margin = new Padding(0, 2, 0, 2)
+			Text = "Selection:", AutoSize = true, Anchor = AnchorStyles.Left
+		};
+		var separatorLabel = new Label {
+			Text = "Separator:", AutoSize = true, Anchor = AnchorStyles.Left
 		};
 		controlsLayout.Controls.Add(filterLabel, 0, 0);
 		controlsLayout.SetColumnSpan(filterLabel, 2);
@@ -978,36 +1036,38 @@ public static class ClipboardFusionHelper
 		controlsLayout.SetColumnSpan(selectionButtonRow, 2);
 		controlsLayout.Controls.Add(modeToggleButton, 0, 6);
 		controlsLayout.Controls.Add(modeAffixTextBox, 1, 6);
-		controlsLayout.Controls.Add(new Label { Text = "Separator:", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Top, Margin = labelMargin }, 0, 7);
+		controlsLayout.Controls.Add(separatorLabel, 0, 7);
 		controlsLayout.Controls.Add(separatorTextBox, 1, 7);
 		int sourceSelectorWidth = SourceSelectorOptions.Max(optionText => TextRenderer.MeasureText(optionText, monospaceFont).Width) + SystemInformation.VerticalScrollBarWidth + SourceSelectorWidthPadding;
 		var sourceSelectorComboBox = new ComboBox {
 			DropDownStyle = ComboBoxStyle.DropDownList,
 			Width = sourceSelectorWidth,
 			Anchor = AnchorStyles.Left,
-			Margin = new Padding(0)
+			Margin = Padding.Empty
 		};
 		sourceSelectorComboBox.Items.AddRange(SourceSelectorOptions);
 		sourceSelectorComboBox.SelectedIndex = (int)currentSource;
 
 		var okButton = new Button {
-			Text = "OK", DialogResult = DialogResult.OK, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
+			Text = "OK", DialogResult = DialogResult.OK, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+			Margin = Padding.Empty
 		};
 		var cancelButton = new Button {
-			Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
+			Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+			Margin = Padding.Empty
 		};
-		okButton.Margin = new Padding(0, 0, 8, 0);
-		cancelButton.Margin = new Padding(0);
 		var dialogActionButtonRow = new FlowLayoutPanel {
 			AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false,
-			FlowDirection = FlowDirection.RightToLeft, Anchor = AnchorStyles.Right, Margin = new Padding(0), Padding = new Padding(0)
+			FlowDirection = FlowDirection.RightToLeft, Anchor = AnchorStyles.Right,
+			Margin = Padding.Empty,
+			Padding = Padding.Empty
 		};
 		dialogActionButtonRow.Controls.Add(cancelButton);
 		dialogActionButtonRow.Controls.Add(okButton);
 		var dialogFooterLayout = new TableLayoutPanel {
 			Dock = DockStyle.Bottom, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-			ColumnCount = 2, RowCount = 1,
-			Padding = new Padding(4, 6, 4, 6)
+			Padding = Padding.Empty,
+			ColumnCount = 2, RowCount = 1
 		};
 		dialogFooterLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 		dialogFooterLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1016,7 +1076,7 @@ public static class ClipboardFusionHelper
 		dialogFooterLayout.Controls.Add(dialogActionButtonRow, 1, 0);
 		int controlsPanelMinimumWidth = ControlsPanelMinimumWidth;
 
-		var controlsPanel = new Panel { Dock = DockStyle.Right, Width = controlsPanelMinimumWidth, MinimumSize = new Size(controlsPanelMinimumWidth, 0) };
+		var controlsPanel = new Panel { Dock = DockStyle.Right, Width = controlsPanelMinimumWidth, MinimumSize = new Size(controlsPanelMinimumWidth, 0), Padding = new Padding(SystemInformation.Border3DSize.Width) };
 		controlsPanel.Controls.Add(controlsLayout);
 		controlsPanel.Controls.Add(dialogFooterLayout);
 
@@ -1370,7 +1430,7 @@ public static class ClipboardFusionHelper
 			}
 			if (focusedControl == modeToggleButton)
 			{
-				modeToggleButton.Checked = !modeToggleButton.Checked;
+				modeToggleButton.PerformClick();
 				eventArgs.SuppressKeyPress = true;
 				eventArgs.Handled = true;
 				focusControl(modeAffixTextBox);
@@ -1420,7 +1480,6 @@ public static class ClipboardFusionHelper
 		}
 
 		var selectedHistoryIndices = selectedHistoryIndexSet.OrderBy(selectionIndex => selectionIndex).ToList();
-		bool isNumberedMode = modeToggleButton.Checked;
 		string itemAffixText = modeAffixTextBox.Text;
 		string separatorText;
 		if (!TryUnescapeSeparatorText(separatorTextBox.Text, out separatorText))
